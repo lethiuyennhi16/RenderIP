@@ -8,6 +8,11 @@ module READ_MASTER (
     input  logic [31:0] RM_startaddress,
     output logic        RM_done,
     
+    // Interface với CONTROL_MATRIX
+    output logic        CM_lookat_data_valid,
+    output logic [31:0] CM_lookat_data,
+    input  logic        CM_lookat_ready,
+    
     // Interface FIFO-VERTEX (chỉ GHI vertex data)
     input  logic        FF_vertex_almostfull,
     output logic        FF_vertex_writerequest,
@@ -15,10 +20,10 @@ module READ_MASTER (
     
     // Interface FIFO-TEXTURE (chỉ ĐỌC texture addresses và z-buffer)
     input  logic        FF_texture_empty,
-    output logic        FF_texture_readrequest,Scenario:
+    output logic        FF_texture_readrequest,
     input  logic [31:0] FF_texture_q,        // [31:24]=core_id, [23:0]=address
     
-    // Interface FIFO-RGB (chỉ GHI RGB, z-buffer values)
+    // Interface FIFO-RGB (chỉ GHI RGB values)
     input  logic        FF_rgb_almostfull,
     output logic        FF_rgb_writerequest,
     output logic [31:0] FF_rgb_data,
@@ -40,11 +45,13 @@ module READ_MASTER (
     // FSM for vertex reading
     typedef enum logic [2:0] {
         V_IDLE            = 3'b000,
-        V_START_BURST     = 3'b001,
-        V_BURST_READ      = 3'b010,
-        V_WAIT_DATA       = 3'b011,
-        V_WRITE_FIFO      = 3'b100,
-        V_DONE            = 3'b101
+        V_READ_LOOKAT     = 3'b001,  // Thêm state mới cho lookat
+        V_SEND_LOOKAT     = 3'b002,  // Gửi lookat data cho CONTROL_MATRIX
+        V_START_BURST     = 3'b011,
+        V_BURST_READ      = 3'b100,
+        V_WAIT_DATA       = 3'b101,
+        V_WRITE_FIFO      = 3'b110,
+        V_DONE            = 3'b111
     } vertex_state_t;
     
     // FSM for texture/z-buffer reading
@@ -76,6 +83,10 @@ module READ_MASTER (
     logic [2:0]  burst_word_count;      // 0-7 within current burst
     logic [1:0]  face_burst_count;      // 0-2 bursts per face
     logic        vertex_reading_burst;   // Flag: currently in burst read
+    
+    // Lookat data management
+    logic [3:0]  lookat_count;          // Counter for 12 lookat words
+    logic [31:0] lookat_buffer[12];     // Buffer for lookat data
     
     // Internal registers for texture
     logic [7:0]  texture_core_id;
@@ -145,6 +156,15 @@ module READ_MASTER (
                         burst_word_count <= 3'b0;
                         face_burst_count <= 2'b0;
                         vertex_reading_burst <= 1'b0;
+                        lookat_count <= 4'b0;  // Reset lookat counter
+                    end
+                end
+                
+                V_READ_LOOKAT: begin
+                    if (iRM_readdatavalid) begin
+                        lookat_buffer[lookat_count] <= iRM_readdata;
+                        lookat_count <= lookat_count + 1'b1;
+                        vertex_address <= vertex_address + 4;
                     end
                 end
                 
@@ -359,15 +379,41 @@ module READ_MASTER (
         oRM_burstcount = 4'b0;
         
         if (vertex_grant) begin
-            oRM_read = 1'b1;
-            oRM_readaddress = vertex_address;
-            oRM_burstcount = VERTEX_BURST_SIZE;
+            if (vertex_cs == V_READ_LOOKAT) begin
+                oRM_read = 1'b1;
+                oRM_readaddress = vertex_address;
+                oRM_burstcount = 4'b1; // Single word reads for lookat
+            end else begin
+                oRM_read = 1'b1;
+                oRM_readaddress = vertex_address;
+                oRM_burstcount = VERTEX_BURST_SIZE;
+            end
         end else if (texture_grant) begin
             oRM_read = 1'b1;
             oRM_readaddress = {8'b0, texture_address}; // Extend to 32-bit
             oRM_burstcount = 4'b1; // Single read
         end
     end
+    
+    // CONTROL_MATRIX interface outputs
+    logic [3:0] cm_send_count;
+    
+    always_ff @(posedge clk, negedge rst_n) begin
+        if (!rst_n) begin
+            cm_send_count <= 4'b0;
+        end else begin
+            if (vertex_cs == V_SEND_LOOKAT) begin
+                if (CM_lookat_ready && cm_send_count < 12) begin
+                    cm_send_count <= cm_send_count + 1'b1;
+                end
+            end else begin
+                cm_send_count <= 4'b0;
+            end
+        end
+    end
+    
+    assign CM_lookat_data_valid = (vertex_cs == V_SEND_LOOKAT) && (cm_send_count < 12);
+    assign CM_lookat_data = lookat_buffer[cm_send_count];
     
     // FIFO interface outputs
     assign FF_vertex_writerequest = (vertex_cs == V_WRITE_FIFO) && !FF_vertex_almostfull && iRM_readdatavalid;

@@ -21,11 +21,15 @@ module CONTROL (
     output logic start_write,
     output logic [31:0] length_write,
     output logic [31:0] WM_startaddress,
-    output logic WM_done,
+    input logic WM_done,  // Changed: input from write master
     
     // Matrix calculation interface
     input logic calc_matrix_done,
     output logic start_calc_matrix,
+    
+    // Interface với CONTROL_MATRIX (thêm mới)
+    output logic [31:0] width_framebuffer,
+    output logic [31:0] height_framebuffer,
     
     // Texture and buffer addresses
     output logic [31:0] width_tex,
@@ -33,7 +37,7 @@ module CONTROL (
     output logic [31:0] addr_diff_tex,
     output logic [31:0] addr_norm_tex,
     output logic [31:0] addr_spec_tex,
-    output logic [31:0] addr_z_buffer, 
+    output logic [31:0] addr_z_buffer,
     
     // Render core interface
     output logic start_render,
@@ -53,8 +57,8 @@ module CONTROL (
     localparam REG_BASE_ADDR_SPEC   = 4'h9;
     localparam REG_BASE_ADDR_ZBUF   = 4'hA;
     localparam REG_BASE_ADDR_FRAME  = 4'hB;
-	localparam REG_BASE_ADDR_WTEXT  = 4'hC;
-	localparam REG_BASE_ADDR_HTEXT  = 4'hD;
+    localparam REG_BASE_ADDR_WTEXT  = 4'hC;
+    localparam REG_BASE_ADDR_HTEXT  = 4'hD;
 
     // Internal registers
     logic [31:0] width_output;
@@ -69,17 +73,18 @@ module CONTROL (
     logic [31:0] base_addr_framebuffer;
     logic [31:0] control;
     logic [31:0] status;
-	logic [31:0] width_texture;
-	logic [31:0] height_texture;
+    logic [31:0] width_texture;
+    logic [31:0] height_texture;
 
-    // State machine
+    // State machine - Updated with READ_OBJ and WRITE_FRAME states
     typedef enum logic [2:0] {
         IDLE         = 3'b000,
         READ_LOOKAT  = 3'b001,
         CALC_MATRIX  = 3'b010,
-        START_RENDER = 3'b011,
+        READ_OBJ     = 3'b011,  // New: Read OBJ data
         RENDERING    = 3'b100,
-        DONE         = 3'b101
+        WRITE_FRAME  = 3'b101,  // New: Write framebuffer
+        DONE         = 3'b110
     } state_t;
 
     state_t current_state, next_state;
@@ -127,16 +132,24 @@ module CONTROL (
             
             CALC_MATRIX: begin
                 if (calc_matrix_done) begin
-                    next_state = START_RENDER;
+                    next_state = READ_OBJ;  // Read OBJ data after matrix calculation
                 end
             end
             
-            START_RENDER: begin
-                next_state = RENDERING; // Chỉ ở đây 1 clock
+            READ_OBJ: begin
+                if (RM_done) begin
+                    next_state = RENDERING;
+                end
             end
             
             RENDERING: begin
                 if (render_done) begin
+                    next_state = WRITE_FRAME;  // Write framebuffer after rendering
+                end
+            end
+            
+            WRITE_FRAME: begin
+                if (WM_done) begin
                     next_state = DONE;
                 end
             end
@@ -166,22 +179,28 @@ module CONTROL (
             
             READ_LOOKAT: begin
                 busy = 1'b1;
-                start_read = 1'b1;  // Continuously assert while reading
+                start_read = 1'b1;
             end
             
             CALC_MATRIX: begin
                 busy = 1'b1;
-                start_calc_matrix = 1'b1;  // Continuously assert while calculating
+                start_calc_matrix = 1'b1;
             end
             
-            START_RENDER: begin
+            READ_OBJ: begin
                 busy = 1'b1;
-                start_render = 1'b1;  // Assert for exactly 1 clock
+                start_read = 1'b1;
+                start_render = 1'b1;  // Start render core while reading OBJ
             end
             
             RENDERING: begin
                 busy = 1'b1;
                 // Just wait for render_done
+            end
+            
+            WRITE_FRAME: begin
+                busy = 1'b1;
+                start_write = 1'b1;
             end
             
             DONE: begin
@@ -197,9 +216,13 @@ module CONTROL (
                 RM_startaddress = base_addr_lookat;
                 length_read = 32'd48;  // 4 vectors * 3 floats * 4 bytes (eye, center, up, light)
             end
-            default: begin
+            READ_OBJ: begin
                 RM_startaddress = base_addr_obj;
                 length_read = length_obj;
+            end
+            default: begin
+                RM_startaddress = 32'h0;
+                length_read = 32'h0;
             end
         endcase
     end
@@ -207,17 +230,18 @@ module CONTROL (
     // Write master assignment
     assign WM_startaddress = base_addr_framebuffer;
     assign length_write = width_output * height_output * 4;  // RGBA, 4 bytes per pixel
-    assign WM_done = (current_state == DONE);
 
-    // Texture outputs
+    // Texture and buffer outputs
     assign width_tex = width_texture;
     assign height_tex = height_texture;
     assign addr_diff_tex = base_addr_diff_tex;
     assign addr_norm_tex = base_addr_norm_tex;
     assign addr_spec_tex = base_addr_spec_tex;
-
+    assign addr_z_buffer = base_addr_z_buffer;
+	assign width_framebuffer = width_output;
+	assign height_framebuffer = height_output;
     // Status register
-    assign status = {26'b0, current_state[2:0], done_flag, busy};
+    assign status = {23'b0, current_state[2:0], 1'b0, done_flag, busy};
 
     // Interrupt generation
     assign interrupt = done_flag;
@@ -236,6 +260,8 @@ module CONTROL (
             base_addr_z_buffer <= 32'h0;
             base_addr_framebuffer <= 32'h0;
             control <= 32'h0;
+            width_texture <= 32'd256;   // Default texture size
+            height_texture <= 32'd256;
         end else begin
             if (chipselect && write) begin
                 case (address)
@@ -250,6 +276,8 @@ module CONTROL (
                     REG_BASE_ADDR_SPEC: base_addr_spec_tex <= writedata;
                     REG_BASE_ADDR_ZBUF: base_addr_z_buffer <= writedata;
                     REG_BASE_ADDR_FRAME: base_addr_framebuffer <= writedata;
+                    REG_BASE_ADDR_WTEXT: width_texture <= writedata;
+                    REG_BASE_ADDR_HTEXT: height_texture <= writedata;
                 endcase
             end
             
@@ -277,6 +305,8 @@ module CONTROL (
                 REG_BASE_ADDR_SPEC: readdata = base_addr_spec_tex;
                 REG_BASE_ADDR_ZBUF: readdata = base_addr_z_buffer;
                 REG_BASE_ADDR_FRAME: readdata = base_addr_framebuffer;
+                REG_BASE_ADDR_WTEXT: readdata = width_texture;
+                REG_BASE_ADDR_HTEXT: readdata = height_texture;
                 default: readdata = 32'h0;
             endcase
         end
