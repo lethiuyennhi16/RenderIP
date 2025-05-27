@@ -97,6 +97,7 @@ module CONTROL_MATRIX (
     logic [31:0] light_view[3];          // Light vector in view coordinates
     logic [31:0] minv_matrix[16];        // Temporary Minv matrix
     logic [31:0] tr_matrix[16];          // Temporary Tr matrix
+	logic [31:0] neg_one_div_f;          //-1/f
     
     // Operation counters and flags
     logic [1:0]  vector_count;           // For 3-element vector operations
