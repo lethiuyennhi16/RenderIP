@@ -27,7 +27,7 @@ module CONTROL (
     input logic calc_matrix_done,
     output logic start_calc_matrix,
     
-    // Interface với CONTROL_MATRIX 
+    // Interface với CONTROL_MATRIX (thêm mới)
     output logic [31:0] width_framebuffer,
     output logic [31:0] height_framebuffer,
     

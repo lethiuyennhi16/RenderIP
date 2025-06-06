@@ -28,7 +28,8 @@ module CONTROL_MATRIX (
     localparam MATRIX_VIEWPORT    = 3'd3;
     localparam MATRIX_COMBINED    = 3'd4;  // ModelView * Projection
     localparam MATRIX_LIGHT       = 3'd5;  // Light vector in view coordinates
-    
+    localparam [31:0] VP_RATIO_3_8  = 32'h3EC00000;  // 0.375f (3/8)
+	localparam [31:0] VP_RATIO_1_2  = 32'h3F000000;  // 0.5f (1/2)	
     // Main FSM states
     typedef enum logic [4:0] {
         IDLE            = 5'd0,
@@ -74,6 +75,59 @@ module CONTROL_MATRIX (
     
     sub_state_t sub_current_state, sub_next_state;
     
+    // Projection calculation FSM  
+    typedef enum logic [1:0] {
+        PROJ_IDLE     = 2'd0,
+        PROJ_CALC_DIV = 2'd1,
+        PROJ_BUILD    = 2'd2
+    } proj_state_t;
+    
+    proj_state_t proj_current_state, proj_next_state;
+    
+    // Viewport calculation FSM - optimized with parallel operations
+    typedef enum logic [2:0] {
+		VP_IDLE              = 3'd0,
+		VP_CALC_WIDTH_BOTH   = 3'd1,  // Calculate width_3_8 and width_1_2 in parallel
+		VP_CALC_HEIGHT_BOTH  = 3'd2,  // Calculate height_3_8 and height_1_2 in parallel
+		VP_BUILD_MATRIX      = 3'd3
+	} viewport_state_t;
+		
+    viewport_state_t vp_current_state, vp_next_state;
+    
+    // Distance calculation FSM
+    typedef enum logic [3:0] {
+		DIST_IDLE         = 4'd0,
+		DIST_MULT_PARALLEL = 4'd1,  // x² and y² parallel
+		DIST_MULT_Z       = 4'd2,   // z²
+		DIST_ADD_XY       = 4'd3,   // x² + y² - NEW STATE
+		DIST_ADD_Z        = 4'd4,   // (x²+y²) + z² - NEW STATE
+		DIST_SQRT         = 4'd5    // sqrt(x²+y²+z²)
+	} dist_state_t;
+    
+    dist_state_t dist_current_state, dist_next_state;
+	
+	typedef enum logic [2:0] {
+		ARITH_IDLE     = 3'd0,
+		ARITH_SEND_A   = 3'd1,
+		ARITH_WAIT_A   = 3'd2,
+		ARITH_SEND_B   = 3'd3,
+		ARITH_WAIT_B   = 3'd4,
+		ARITH_GET_RESULT = 3'd5
+	} arith_state_t;
+
+	// Matrix multiplication state tracking
+	typedef enum logic [1:0] {
+		MAT_MULT_IDLE     = 2'd0,
+		MAT_MULT_SENDING  = 2'd1,
+		MAT_MULT_RECEIVING = 2'd2
+	} mat_mult_state_t;
+
+	mat_mult_state_t mat_mult_state;
+	// Declare states for all arithmetic units
+	arith_state_t add1_state, add2_state;
+	arith_state_t mul1_state, mul2_state;
+	arith_state_t div1_state, div2_state;
+    
     // Input data storage
     logic [31:0] eye[3];         // Camera position
     logic [31:0] center[3];      // Camera target
@@ -97,13 +151,23 @@ module CONTROL_MATRIX (
     logic [31:0] light_view[3];          // Light vector in view coordinates
     logic [31:0] minv_matrix[16];        // Temporary Minv matrix
     logic [31:0] tr_matrix[16];          // Temporary Tr matrix
-	logic [31:0] neg_one_div_f;          //-1/f
+    logic [31:0] neg_one_div_f;          //-1/f
+    
+    // Viewport calculation variables
+    logic [31:0] w_div_8, h_div_8, w_3div4, h_3div4;
+    logic [31:0] w_sum, h_sum;  // Final sums for viewport matrix
+    
+    // Distance calculation variables
+    logic [31:0] x_squared, y_squared, z_squared;
+    logic [31:0] xy_sum, xyz_sum;
     
     // Operation counters and flags
     logic [1:0]  vector_count;           // For 3-element vector operations
     logic [4:0]  matrix_count;           // For matrix element streaming
     logic [4:0]  stream_count;           // For streaming operations
+	logic [1:0]  count_cross_out;
     logic        sub_op_done;
+	logic cross_sending_started;
     
     // Matrix serving
     logic [6:0]  serving_core;
@@ -114,7 +178,16 @@ module CONTROL_MATRIX (
     logic [6:0]  requesting_core;
     logic [2:0]  requesting_opcode;
     logic        valid_request_found;
-    
+	
+	//counter cross
+	logic [1:0] x_cross_count;  
+	logic [1:0] y_cross_count; 
+    //
+	logic mul1_complete, mul2_complete, add1_complete;
+	logic div1_complete;
+	logic build_proj_done;
+	logic [31:0] width_3_8, width_1_2, height_3_8, height_1_2;
+	logic mul1_vp_complete, mul2_vp_complete;
     // Arithmetic unit interfaces
     
     // Adder/Subtractor 1
@@ -307,7 +380,7 @@ module CONTROL_MATRIX (
         .ready(cross_ready),
         .data_valid(cross_data_valid),
         .data(cross_data),
-        .data_done(cross_data_done),
+        //.data_done(cross_data_done),
         .calc_done(cross_calc_done),
         .result(cross_result),
         .read_done(cross_read_done)
@@ -349,44 +422,80 @@ module CONTROL_MATRIX (
                 requesting_opcode = matrix_opcode[i];
                 valid_request_found = 1'b1;
             end
+        end
     end
     
     // Projection calculation using divider unit
     always_ff @(posedge clk, negedge rst_n) begin
-        if (!rst_n) begin
-            neg_one_div_f <= 32'h00000000;
-            // Divider 1 controls  
-            div1_input_a <= 32'b0;
-            div1_input_b <= 32'b0;
-            div1_input_a_stb <= 1'b0;
-            div1_input_b_stb <= 1'b0;
-            div1_output_z_ack <= 1'b0;
-        end else begin
-            // Default values
-            div1_input_a_stb <= 1'b0;
-            div1_input_b_stb <= 1'b0;
-            div1_output_z_ack <= 1'b0;
-            
-            case (proj_current_state)
-                PROJ_CALC_DIV: begin
-                    // Calculate -1 / eye_center_dist
-                    if (!div1_input_a_stb && !div1_input_b_stb) begin
-                        div1_input_a <= 32'hBF800000;  // -1.0f
-                        div1_input_a_stb <= 1'b1;
-                    end else if (div1_input_a_ack && !div1_input_b_stb) begin
-                        div1_input_a_stb <= 1'b0;
-                        div1_input_b <= eye_center_dist;
-                        div1_input_b_stb <= 1'b1;
-                    end else if (div1_input_b_ack) begin
-                        div1_input_b_stb <= 1'b0;
-                    end else if (div1_output_z_stb) begin
-                        neg_one_div_f <= div1_output_z;
-                        div1_output_z_ack <= 1'b1;
-                    end
-                end
-            endcase
-        end
-    end
+		if (!rst_n) begin
+			neg_one_div_f <= 32'h00000000;
+			div1_state <= ARITH_IDLE;
+			div1_complete <= 1'b0;
+			
+			// Divider 1 controls  
+			div1_input_a <= 32'b0;
+			div1_input_b <= 32'b0;
+			div1_input_a_stb <= 1'b0;
+			div1_input_b_stb <= 1'b0;
+			div1_output_z_ack <= 1'b0;
+		end else begin
+			// Default values
+			div1_input_a_stb <= 1'b0;
+			div1_input_b_stb <= 1'b0;
+			div1_output_z_ack <= 1'b0;
+			
+			case (proj_current_state)
+				PROJ_CALC_DIV: begin
+					// Start divider operation
+					if (div1_state == ARITH_IDLE && !div1_complete) begin
+						div1_state <= ARITH_SEND_A;
+						div1_complete <= 1'b0;
+					end
+					
+					// Sequential divider protocol
+					case (div1_state)
+						ARITH_SEND_A: begin
+							div1_input_a <= 32'hBF800000;  // -1.0f
+							div1_input_a_stb <= 1'b1;
+							if (div1_input_a_ack) begin
+								div1_state <= ARITH_WAIT_A;
+							end
+						end
+						
+						ARITH_WAIT_A: begin
+							div1_state <= ARITH_SEND_B;
+						end
+						
+						ARITH_SEND_B: begin
+							div1_input_b <= eye_center_dist;
+							div1_input_b_stb <= 1'b1;
+							if (div1_input_b_ack) begin
+								div1_state <= ARITH_WAIT_B;
+							end
+						end
+						
+						ARITH_WAIT_B: begin
+							div1_state <= ARITH_GET_RESULT;
+						end
+						
+						ARITH_GET_RESULT: begin
+							if (div1_output_z_stb) begin
+								neg_one_div_f <= div1_output_z;
+								div1_output_z_ack <= 1'b1;
+								div1_state <= ARITH_IDLE;
+								div1_complete <= 1'b1;  // Set completion flag
+							end
+						end
+					endcase
+				end
+				
+				default: begin
+					// Reset completion flag when leaving projection calculation
+					div1_complete <= 1'b0;
+				end
+			endcase
+		end
+	end
     
     // Viewport calculation using multiplier unit
     always_ff @(posedge clk, negedge rst_n) begin
@@ -395,77 +504,183 @@ module CONTROL_MATRIX (
             h_div_8 <= 32'b0;
             w_3div4 <= 32'b0;
             h_3div4 <= 32'b0;
+            // Multiplier controls
+            mul1_input_a <= 32'b0;
+            mul1_input_b <= 32'b0;
+            mul1_input_a_stb <= 1'b0;
+            mul1_input_b_stb <= 1'b0;
+            mul1_output_z_ack <= 1'b0;
         end else begin
+            // Default values
+            mul1_input_a_stb <= 1'b0;
+            mul1_input_b_stb <= 1'b0;
+            mul1_output_z_ack <= 1'b0;
+            
             case (vp_current_state)
-                VP_CALC_W_DIV8: begin
-                    // Calculate width / 8 using multiplier (multiply by 1/8 = 0.125)
-                    if (!mul_input_a_stb && !mul_input_b_stb) begin
-                        mul_input_a <= width_framebuffer;
-                        mul_input_a_stb <= 1'b1;
-                    end else if (mul_input_a_ack && !mul_input_b_stb) begin
-                        mul_input_a_stb <= 1'b0;
-                        mul_input_b <= 32'h3E000000;  // 0.125f (1/8)
-                        mul_input_b_stb <= 1'b1;
-                    end else if (mul_input_b_ack) begin
-                        mul_input_b_stb <= 1'b0;
-                    end else if (mul_output_z_stb) begin
-                        w_div_8 <= mul_output_z;
-                        mul_output_z_ack <= 1'b1;
-                    end
-                end
-                
-                VP_CALC_H_DIV8: begin
-                    // Calculate height / 8
-                    if (!mul_input_a_stb && !mul_input_b_stb) begin
-                        mul_input_a <= height_framebuffer;
-                        mul_input_a_stb <= 1'b1;
-                    end else if (mul_input_a_ack && !mul_input_b_stb) begin
-                        mul_input_a_stb <= 1'b0;
-                        mul_input_b <= 32'h3E000000;  // 0.125f (1/8)
-                        mul_input_b_stb <= 1'b1;
-                    end else if (mul_input_b_ack) begin
-                        mul_input_b_stb <= 1'b0;
-                    end else if (mul_output_z_stb) begin
-                        h_div_8 <= mul_output_z;
-                        mul_output_z_ack <= 1'b1;
-                    end
-                end
-                
-                VP_CALC_W_3DIV4: begin
-                    // Calculate width * 3/4
-                    if (!mul_input_a_stb && !mul_input_b_stb) begin
-                        mul_input_a <= width_framebuffer;
-                        mul_input_a_stb <= 1'b1;
-                    end else if (mul_input_a_ack && !mul_input_b_stb) begin
-                        mul_input_a_stb <= 1'b0;
-                        mul_input_b <= 32'h3F400000;  // 0.75f (3/4)
-                        mul_input_b_stb <= 1'b1;
-                    end else if (mul_input_b_ack) begin
-                        mul_input_b_stb <= 1'b0;
-                    end else if (mul_output_z_stb) begin
-                        w_3div4 <= mul_output_z;
-                        mul_output_z_ack <= 1'b1;
-                    end
-                end
-                
-                VP_CALC_H_3DIV4: begin
-                    // Calculate height * 3/4
-                    if (!mul_input_a_stb && !mul_input_b_stb) begin
-                        mul_input_a <= height_framebuffer;
-                        mul_input_a_stb <= 1'b1;
-                    end else if (mul_input_a_ack && !mul_input_b_stb) begin
-                        mul_input_a_stb <= 1'b0;
-                        mul_input_b <= 32'h3F400000;  // 0.75f (3/4)
-                        mul_input_b_stb <= 1'b1;
-                    end else if (mul_input_b_ack) begin
-                        mul_input_b_stb <= 1'b0;
-                    end else if (mul_output_z_stb) begin
-                        h_3div4 <= mul_output_z;
-                        mul_output_z_ack <= 1'b1;
-                    end
-                end
-            endcase
-        end
+				VP_CALC_WIDTH_BOTH: begin
+					// PARALLEL: mul1 for width*3/8, mul2 for width*1/2
+					if (mul1_state == ARITH_IDLE && mul2_state == ARITH_IDLE && 
+						!mul1_vp_complete && !mul2_vp_complete) begin
+						mul1_state <= ARITH_SEND_A;
+						mul2_state <= ARITH_SEND_A;
+					end
+					
+					// mul1: width * 3/8
+					case (mul1_state)
+						ARITH_SEND_A: begin
+							mul1_input_a <= width_framebuffer;
+							mul1_input_a_stb <= 1'b1;
+							if (mul1_input_a_ack) begin
+								mul1_state <= ARITH_WAIT_A;
+							end
+						end
+						
+						ARITH_WAIT_A: begin
+							mul1_state <= ARITH_SEND_B;
+						end
+						
+						ARITH_SEND_B: begin
+							mul1_input_b <= VP_RATIO_3_8;  // 3/8
+							mul1_input_b_stb <= 1'b1;
+							if (mul1_input_b_ack) begin
+								mul1_state <= ARITH_WAIT_B;
+							end
+						end
+						
+						ARITH_WAIT_B: begin
+							mul1_state <= ARITH_GET_RESULT;
+						end
+						
+						ARITH_GET_RESULT: begin
+							if (mul1_output_z_stb) begin
+								width_3_8 <= mul1_output_z;
+								mul1_output_z_ack <= 1'b1;
+								mul1_state <= ARITH_IDLE;
+								mul1_vp_complete <= 1'b1;
+							end
+						end
+					endcase
+					
+					// mul2: width * 1/2
+					case (mul2_state)
+						ARITH_SEND_A: begin
+							mul2_input_a <= width_framebuffer;
+							mul2_input_a_stb <= 1'b1;
+							if (mul2_input_a_ack) begin
+								mul2_state <= ARITH_WAIT_A;
+							end
+						end
+						
+						ARITH_WAIT_A: begin
+							mul2_state <= ARITH_SEND_B;
+						end
+						
+						ARITH_SEND_B: begin
+							mul2_input_b <= VP_RATIO_1_2;  // 1/2
+							mul2_input_b_stb <= 1'b1;
+							if (mul2_input_b_ack) begin
+								mul2_state <= ARITH_WAIT_B;
+							end
+						end
+						
+						ARITH_WAIT_B: begin
+							mul2_state <= ARITH_GET_RESULT;
+						end
+						
+						ARITH_GET_RESULT: begin
+							if (mul2_output_z_stb) begin
+								width_1_2 <= mul2_output_z;
+								mul2_output_z_ack <= 1'b1;
+								mul2_state <= ARITH_IDLE;
+								mul2_vp_complete <= 1'b1;
+							end
+						end
+					endcase
+				end
+				
+				VP_CALC_HEIGHT_BOTH: begin
+					// PARALLEL: mul1 for height*3/8, mul2 for height*1/2
+					if (mul1_state == ARITH_IDLE && mul2_state == ARITH_IDLE && 
+						!mul1_vp_complete && !mul2_vp_complete) begin
+						mul1_state <= ARITH_SEND_A;
+						mul2_state <= ARITH_SEND_A;
+						mul1_vp_complete <= 1'b0;  // Reset for new operation
+						mul2_vp_complete <= 1'b0;
+					end
+					
+					// mul1: height * 3/8
+					case (mul1_state)
+						ARITH_SEND_A: begin
+							mul1_input_a <= height_framebuffer;
+							mul1_input_a_stb <= 1'b1;
+							if (mul1_input_a_ack) begin
+								mul1_state <= ARITH_WAIT_A;
+							end
+						end
+						
+						ARITH_WAIT_A: begin
+							mul1_state <= ARITH_SEND_B;
+						end
+						
+						ARITH_SEND_B: begin
+							mul1_input_b <= VP_RATIO_3_8;  // 3/8
+							mul1_input_b_stb <= 1'b1;
+							if (mul1_input_b_ack) begin
+								mul1_state <= ARITH_WAIT_B;
+							end
+						end
+						
+						ARITH_WAIT_B: begin
+							mul1_state <= ARITH_GET_RESULT;
+						end
+						
+						ARITH_GET_RESULT: begin
+							if (mul1_output_z_stb) begin
+								height_3_8 <= mul1_output_z;
+								mul1_output_z_ack <= 1'b1;
+								mul1_state <= ARITH_IDLE;
+								mul1_vp_complete <= 1'b1;
+							end
+						end
+					endcase
+					
+					// mul2: height * 1/2
+					case (mul2_state)
+						ARITH_SEND_A: begin
+							mul2_input_a <= height_framebuffer;
+							mul2_input_a_stb <= 1'b1;
+							if (mul2_input_a_ack) begin
+								mul2_state <= ARITH_WAIT_A;
+							end
+						end
+						
+						ARITH_WAIT_A: begin
+							mul2_state <= ARITH_SEND_B;
+						end
+						
+						ARITH_SEND_B: begin
+							mul2_input_b <= VP_RATIO_1_2;  // 1/2
+							mul2_input_b_stb <= 1'b1;
+							if (mul2_input_b_ack) begin
+								mul2_state <= ARITH_WAIT_B;
+							end
+						end
+						
+						ARITH_WAIT_B: begin
+							mul2_state <= ARITH_GET_RESULT;
+						end
+						
+						ARITH_GET_RESULT: begin
+							if (mul2_output_z_stb) begin
+								height_1_2 <= mul2_output_z;
+								mul2_output_z_ack <= 1'b1;
+								mul2_state <= ARITH_IDLE;
+								mul2_vp_complete <= 1'b1;
+							end
+						end
+					endcase
+				end
+			endcase
         end
     end
     
@@ -484,6 +699,33 @@ module CONTROL_MATRIX (
             sub_current_state <= SUB_IDLE;
         end else begin
             sub_current_state <= sub_next_state;
+        end
+    end
+    
+    // Projection calculation sub-FSM
+    always_ff @(posedge clk, negedge rst_n) begin
+        if (!rst_n) begin
+            proj_current_state <= PROJ_IDLE;
+        end else begin
+            proj_current_state <= proj_next_state;
+        end
+    end
+    
+    // Viewport calculation sub-FSM
+    always_ff @(posedge clk, negedge rst_n) begin
+        if (!rst_n) begin
+            vp_current_state <= VP_IDLE;
+        end else begin
+            vp_current_state <= vp_next_state;
+        end
+    end
+    
+    // Distance calculation sub-FSM
+    always_ff @(posedge clk, negedge rst_n) begin
+        if (!rst_n) begin
+            dist_current_state <= DIST_IDLE;
+        end else begin
+            dist_current_state <= dist_next_state;
         end
     end
     
@@ -519,7 +761,7 @@ module CONTROL_MATRIX (
             end
             
             CALC_X_CROSS: begin
-                if (cross_calc_done) begin
+                if (cross_calc_done && x_cross_count == 2'd2) begin
                     next_state = CALC_X_NORM;
                 end
             end
@@ -531,7 +773,7 @@ module CONTROL_MATRIX (
             end
             
             CALC_Y_CROSS: begin
-                if (cross_calc_done) begin
+                if (cross_calc_done && y_cross_count == 2'd2) begin
                     next_state = BUILD_MINV;
                 end
             end
@@ -545,13 +787,13 @@ module CONTROL_MATRIX (
             end
             
             MULT_MODELVIEW: begin
-                if (mat_mult_calc_done) begin
-                    next_state = CALC_EYE_CENTER_DIST;
-                end
-            end
+				if (mat_mult_state == MAT_MULT_IDLE && mat_mult_read_done) begin
+					next_state = CALC_EYE_CENTER_DIST;
+				end
+			end
             
             CALC_EYE_CENTER_DIST: begin
-                if (sqrt_calc_done) begin
+                if (dist_current_state == DIST_IDLE && sqrt_calc_done) begin
                     next_state = CALC_PROJECTION;
                 end
             end
@@ -569,16 +811,16 @@ module CONTROL_MATRIX (
             end
             
             MULT_COMBINED: begin
-                if (mat_mult_calc_done) begin
-                    next_state = MULT_LIGHT;
-                end
-            end
+				if (mat_mult_state == MAT_MULT_IDLE && mat_mult_read_done) begin
+					next_state = MULT_LIGHT;
+				end
+			end
             
             MULT_LIGHT: begin
-                if (mat_mult_calc_done) begin
-                    next_state = MATRICES_READY;
-                end
-            end
+				if (mat_mult_state == MAT_MULT_IDLE && mat_mult_read_done) begin
+					next_state = MATRICES_READY;
+				end
+			end
             
             MATRICES_READY: begin
                 if (valid_request_found) begin
@@ -607,132 +849,281 @@ module CONTROL_MATRIX (
     
     // Sub-FSM next state logic for vector subtraction
     always_comb begin
-        sub_next_state = sub_current_state;
-        
-        case (sub_current_state)
-            SUB_IDLE: begin
-                if (current_state == CALC_Z_SUB && vector_count < 3) begin
-                    sub_next_state = SUB_SEND_A;
-                end
-            end
-            
-            SUB_SEND_A: begin
-                if (add1_input_a_ack) begin
-                    sub_next_state = SUB_WAIT_A;
-                end
-            end
-            
-            SUB_WAIT_A: begin
-                sub_next_state = SUB_SEND_B;
-            end
-            
-            SUB_SEND_B: begin
-                if (add1_input_b_ack) begin
-                    sub_next_state = SUB_WAIT_B;
-                end
-            end
-            
-            SUB_WAIT_B: begin
-                sub_next_state = SUB_GET_RESULT;
-            end
-            
-            SUB_GET_RESULT: begin
-                if (add1_output_z_stb) begin
-                    sub_next_state = SUB_DONE;
-                end
-            end
-            
-            SUB_DONE: begin
-                sub_next_state = SUB_IDLE;
-            end
-        endcase
-    end
+    sub_next_state = sub_current_state;
     
+		case (sub_current_state)
+			SUB_IDLE: begin
+				if (current_state == CALC_Z_SUB && !sub_op_done) begin
+					sub_next_state = SUB_SEND_A;
+				end
+			end
+			
+			SUB_SEND_A: begin
+				if (add1_input_a_ack) begin
+					sub_next_state = SUB_WAIT_A;
+				end
+			end
+			
+			SUB_WAIT_A: begin
+				// Wait one cycle for handshake to complete
+				sub_next_state = SUB_SEND_B;
+			end
+			
+			SUB_SEND_B: begin
+				if (add1_input_b_ack) begin
+					sub_next_state = SUB_WAIT_B;
+				end
+			end
+			
+			SUB_WAIT_B: begin
+				// Wait one cycle for handshake to complete
+				sub_next_state = SUB_GET_RESULT;
+			end
+			
+			SUB_GET_RESULT: begin
+				if (add1_output_z_stb) begin
+					sub_next_state = SUB_DONE;
+				end
+			end
+			
+			SUB_DONE: begin
+				if (vector_count == 2) begin
+					// All components done, stay in SUB_DONE until main FSM moves away
+					sub_next_state = SUB_IDLE;
+				end else begin
+					// More components to process, go back to SUB_SEND_A
+					sub_next_state = SUB_SEND_A;
+				end
+			end
+			
+			default: begin
+				sub_next_state = SUB_IDLE;
+			end
+		endcase
+	end
+    
+    // Viewport FSM next state logic
+    always_comb begin
+		vp_next_state = vp_current_state;
+		
+		case (vp_current_state)
+			VP_IDLE: begin
+				if (current_state == CALC_VIEWPORT) begin
+					vp_next_state = VP_CALC_WIDTH_BOTH;
+				end
+			end
+			
+			VP_CALC_WIDTH_BOTH: begin
+				if (mul1_state == ARITH_IDLE && mul2_state == ARITH_IDLE && 
+					mul1_vp_complete && mul2_vp_complete) begin
+					vp_next_state = VP_CALC_HEIGHT_BOTH;
+				end
+			end
+			
+			VP_CALC_HEIGHT_BOTH: begin
+				if (mul1_state == ARITH_IDLE && mul2_state == ARITH_IDLE && 
+					mul1_vp_complete && mul2_vp_complete) begin
+					vp_next_state = VP_BUILD_MATRIX;
+				end
+			end
+			
+			VP_BUILD_MATRIX: begin
+				vp_next_state = VP_IDLE;
+			end
+		endcase
+	end
+    
+    // Distance FSM next state logic
+    always_comb begin
+		dist_next_state = dist_current_state;
+		
+		case (dist_current_state)
+			DIST_IDLE: begin
+				if (current_state == CALC_EYE_CENTER_DIST) begin
+					dist_next_state = DIST_MULT_PARALLEL;
+				end
+			end
+			
+			DIST_MULT_PARALLEL: begin
+				if (mul1_state == ARITH_IDLE && mul2_state == ARITH_IDLE && 
+					mul1_complete && mul2_complete) begin
+					dist_next_state = DIST_MULT_Z;
+				end
+			end
+			
+			DIST_MULT_Z: begin
+				if (mul1_state == ARITH_IDLE && mul1_complete) begin
+					dist_next_state = DIST_ADD_XY;
+				end
+			end
+			
+			DIST_ADD_XY: begin
+				if (add1_state == ARITH_IDLE && add1_complete) begin
+					dist_next_state = DIST_ADD_Z;
+				end
+			end
+			
+			DIST_ADD_Z: begin
+				if (add1_state == ARITH_IDLE && add1_complete) begin
+					dist_next_state = DIST_SQRT;
+				end
+			end
+			
+			DIST_SQRT: begin
+				if (sqrt_calc_done) begin
+					dist_next_state = DIST_IDLE;
+				end
+			end
+		endcase
+	end
+    //FSM Projection matrix
+	always_comb begin
+		proj_next_state = proj_current_state;
+		
+		case (proj_current_state)
+			PROJ_IDLE: begin
+				if (current_state == CALC_PROJECTION) begin
+					proj_next_state = PROJ_CALC_DIV;
+				end
+			end
+			
+			PROJ_CALC_DIV: begin
+				if (div1_state == ARITH_IDLE && div1_complete) begin
+					proj_next_state = PROJ_BUILD;
+				end
+			end
+			
+			PROJ_BUILD: begin
+				if (build_proj_done == 1'b1) begin
+					proj_next_state = PROJ_IDLE;
+				end
+			end
+		endcase
+	end
     // Input data reception
     always_ff @(posedge clk, negedge rst_n) begin
-        if (!rst_n) begin
-            data_count <= 4'b0;
-            for (int i = 0; i < 3; i++) begin
-                eye[i] <= 32'b0;
-                center[i] <= 32'b0;
-                up[i] <= 32'b0;
-                light[i] <= 32'b0;
-            end
-        end else begin
-            if (current_state == RECEIVE_DATA && lookat_data_valid) begin
-                case (data_count)
-                    4'd0: eye[0] <= lookat_data;      // eye_x
-                    4'd1: eye[1] <= lookat_data;      // eye_y
-                    4'd2: eye[2] <= lookat_data;      // eye_z
-                    4'd3: center[0] <= lookat_data;   // center_x
-                    4'd4: center[1] <= lookat_data;   // center_y
-                    4'd5: center[2] <= lookat_data;   // center_z
-                    4'd6: up[0] <= lookat_data;       // up_x
-                    4'd7: up[1] <= lookat_data;       // up_y
-                    4'd8: up[2] <= lookat_data;       // up_z
-                    4'd9: light[0] <= lookat_data;    // light_x
-                    4'd10: light[1] <= lookat_data;   // light_y
-                    4'd11: light[2] <= lookat_data;   // light_z
-                endcase
-                data_count <= data_count + 1'b1;
-            end else if (current_state == IDLE) begin
-                data_count <= 4'b0;
-            end
-        end
-    end
+		if (!rst_n) begin
+			data_count <= 4'b0;
+		end else begin
+			case (current_state)
+				RECEIVE_DATA: begin
+					if (lookat_data_valid) begin
+						if (data_count == 11) begin
+							data_count <= 4'b0;
+						end else begin
+							data_count <= data_count + 1'b1;
+						end
+					end
+				end
+				default: data_count <= 4'b0;
+			endcase
+		end
+	end
+
+	// Vector data loading
+	always_ff @(posedge clk, negedge rst_n) begin
+		if (!rst_n) begin
+			for (int i = 0; i < 3; i++) begin
+				eye[i] <= 32'b0;
+				center[i] <= 32'b0;
+				up[i] <= 32'b0;
+				light[i] <= 32'b0;
+			end
+		end else begin
+			if (current_state == RECEIVE_DATA && lookat_data_valid) begin
+				// Load based on current counter (before increment)
+				if (data_count < 3) begin
+					eye[data_count] <= lookat_data;
+				end else if (data_count < 6) begin
+					center[data_count - 3] <= lookat_data;
+				end else if (data_count < 9) begin
+					up[data_count - 6] <= lookat_data;
+				end else if (data_count < 12) begin
+					light[data_count - 9] <= lookat_data;
+				end
+			end
+		end
+	end
     
-    // Vector subtraction control (z = center - eye) - using adder_1
-    always_ff @(posedge clk, negedge rst_n) begin
-        if (!rst_n) begin
-            vector_count <= 2'b0;
-            sub_op_done <= 1'b0;
-            add1_input_a <= 32'b0;
-            add1_input_b <= 32'b0;
-            add1_input_a_stb <= 1'b0;
-            add1_input_b_stb <= 1'b0;
-            add1_output_z_ack <= 1'b0;
-        end else begin
-            // Default values
-            add1_input_a_stb <= 1'b0;
-            add1_input_b_stb <= 1'b0;
-            add1_output_z_ack <= 1'b0;
-            
-            case (current_state)
-                CALC_Z_SUB: begin
-                    case (sub_current_state)
-                        SUB_SEND_A: begin
-                            add1_input_a <= center[vector_count];
-                            add1_input_a_stb <= 1'b1;
-                        end
-                        
-                        SUB_SEND_B: begin
-                            // For subtraction: add1_input_b should be negative of eye
-                            add1_input_b <= {~eye[vector_count][31], eye[vector_count][30:0]}; // Flip sign bit
-                            add1_input_b_stb <= 1'b1;
-                        end
-                        
-                        SUB_GET_RESULT: begin
-                            add1_output_z_ack <= 1'b1;
-                            z_temp[vector_count] <= add1_output_z;
-                        end
-                        
-                        SUB_DONE: begin
-                            vector_count <= vector_count + 1'b1;
-                            if (vector_count == 2) begin
-                                sub_op_done <= 1'b1;
-                                vector_count <= 2'b0;
-                            end
-                        end
-                    endcase
-                end
-                
-                default: begin
-                    sub_op_done <= 1'b0;
-                    vector_count <= 2'b0;
-                end
-            endcase
-        end
-    end
+// Vector subtraction control (z = center - eye) - using adder_1
+	always_ff @(posedge clk, negedge rst_n) begin
+		if (!rst_n) begin
+			vector_count <= 2'b0;
+			sub_op_done <= 1'b0;
+			add1_input_a <= 32'b0;
+			add1_input_b <= 32'b0;
+			add1_input_a_stb <= 1'b0;
+			add1_input_b_stb <= 1'b0;
+			add1_output_z_ack <= 1'b0;
+		end else begin
+			if (current_state == CALC_Z_SUB) begin
+				case (sub_current_state)
+					SUB_IDLE: begin
+						sub_op_done <= 1'b0;
+						add1_input_a_stb <= 1'b0;
+						add1_input_b_stb <= 1'b0;
+						add1_output_z_ack <= 1'b0;
+					end
+					
+					SUB_SEND_A: begin
+						add1_input_a <= center[vector_count];
+						add1_input_a_stb <= 1'b1;
+						add1_input_b_stb <= 1'b0;
+						add1_output_z_ack <= 1'b0;
+					end
+					
+					SUB_WAIT_A: begin
+						add1_input_a_stb <= 1'b0;
+						add1_input_b_stb <= 1'b0;
+						add1_output_z_ack <= 1'b0;
+					end
+					
+					SUB_SEND_B: begin
+						add1_input_b <= {~eye[vector_count][31], eye[vector_count][30:0]};
+						add1_input_a_stb <= 1'b0;
+						add1_input_b_stb <= 1'b1;
+						add1_output_z_ack <= 1'b0;
+					end
+					
+					SUB_WAIT_B: begin
+						add1_input_a_stb <= 1'b0;
+						add1_input_b_stb <= 1'b0;
+						add1_output_z_ack <= 1'b0;
+					end
+					
+					SUB_GET_RESULT: begin
+						add1_input_a_stb <= 1'b0;
+						add1_input_b_stb <= 1'b0;
+						if (add1_output_z_stb) begin
+							add1_output_z_ack <= 1'b1;
+							z_temp[vector_count] <= add1_output_z;
+						end else begin
+							add1_output_z_ack <= 1'b0;
+						end
+					end
+					
+					SUB_DONE: begin
+						add1_input_a_stb <= 1'b0;
+						add1_input_b_stb <= 1'b0;
+						add1_output_z_ack <= 1'b1;  // EXPLICIT SET - NO DEFAULT CONFLICT
+						
+						if (vector_count == 2) begin
+							sub_op_done <= 1'b1;
+							vector_count <= 2'b0;
+						end else begin
+							vector_count <= vector_count + 1'b1;
+						end
+					end
+				endcase
+			end else begin
+				sub_op_done <= 1'b0;
+				vector_count <= 2'b0;
+				add1_input_a_stb <= 1'b0;
+				add1_input_b_stb <= 1'b0;
+				add1_output_z_ack <= 1'b0;
+			end
+		end
+	end
     
     // Vector normalize control
     always_ff @(posedge clk, negedge rst_n) begin
@@ -778,70 +1169,136 @@ module CONTROL_MATRIX (
     end
     
     // Cross product control (stream interface)
-    always_ff @(posedge clk, negedge rst_n) begin
-        if (!rst_n) begin
-            cross_data_valid <= 1'b0;
-            cross_read_done <= 1'b0;
-            stream_count <= 5'b0;
-        end else begin
-            cross_data_valid <= 1'b0;
-            cross_read_done <= 1'b0;
-            
-            case (current_state)
-                CALC_X_CROSS: begin
-                    if (cross_ready && stream_count < 6) begin
-                        cross_data_valid <= 1'b1;
-                        // Stream: up[0], up[1], up[2], z_vec[0], z_vec[1], z_vec[2]
-                        case (stream_count)
-                            5'd0: cross_data <= up[0];
-                            5'd1: cross_data <= up[1];
-                            5'd2: cross_data <= up[2];
-                            5'd3: cross_data <= z_vec[0];
-                            5'd4: cross_data <= z_vec[1];
-                            5'd5: cross_data <= z_vec[2];
-                        endcase
-                        stream_count <= stream_count + 1'b1;
-                    end
-                    if (cross_calc_done && stream_count < 3) begin
-                        x_temp[stream_count] <= cross_result;
-                        stream_count <= stream_count + 1'b1;
-                        if (stream_count == 2) begin
-                            cross_read_done <= 1'b1;
-                            stream_count <= 5'b0;
-                        end
-                    end
-                end
-                
-                CALC_Y_CROSS: begin
-                    if (cross_ready && stream_count < 6) begin
-                        cross_data_valid <= 1'b1;
-                        // Stream: z_vec[0], z_vec[1], z_vec[2], x_vec[0], x_vec[1], x_vec[2]
-                        case (stream_count)
-                            5'd0: cross_data <= z_vec[0];
-                            5'd1: cross_data <= z_vec[1];
-                            5'd2: cross_data <= z_vec[2];
-                            5'd3: cross_data <= x_vec[0];
-                            5'd4: cross_data <= x_vec[1];
-                            5'd5: cross_data <= x_vec[2];
-                        endcase
-                        stream_count <= stream_count + 1'b1;
-                    end
-                    if (cross_calc_done && stream_count < 3) begin
-                        y_vec[stream_count] <= cross_result;
-                        stream_count <= stream_count + 1'b1;
-                        if (stream_count == 2) begin
-                            cross_read_done <= 1'b1;
-                            stream_count <= 5'b0;
-                        end
-                    end
-                end
-                
-                default: begin
-                    stream_count <= 5'b0;
-                end
-            endcase
-        end
-    end
+
+	always_ff @(posedge clk, negedge rst_n) begin
+		if (!rst_n) begin
+			x_cross_count <= 2'b0;
+		end else begin
+			if (current_state == CALC_X_CROSS) begin
+				if (cross_calc_done) begin
+					if (x_cross_count == 2'd2) begin
+						x_cross_count <= 2'b0;  // Reset after 3rd element
+					end else begin
+						x_cross_count <= x_cross_count + 1'b1;  // Increment
+					end
+				end
+			end else begin
+				x_cross_count <= 2'b0;  // Reset when not in CALC_X_CROSS
+			end
+		end
+	end
+
+	// Y Cross Counter Logic  
+	always_ff @(posedge clk, negedge rst_n) begin
+		if (!rst_n) begin
+			y_cross_count <= 2'b0;
+		end else begin
+			if (current_state == CALC_Y_CROSS) begin
+				if (cross_calc_done) begin
+					if (y_cross_count == 2'd2) begin
+						y_cross_count <= 2'b0;  // Reset after 3rd element
+					end else begin
+						y_cross_count <= y_cross_count + 1'b1;  // Increment
+					end
+				end
+			end else begin
+				y_cross_count <= 2'b0;  // Reset when not in CALC_Y_CROSS
+			end
+		end
+	end
+
+	always_ff @(posedge clk, negedge rst_n) begin
+		if (!rst_n) begin
+			cross_data_valid <= 1'b0;
+			cross_read_done <= 1'b0;
+			stream_count <= 5'b0;
+			cross_sending_started <= 1'b0;
+		end else begin
+			// Default values
+			// cross_data_valid <= 1'b0;
+			// cross_read_done <= 1'b0;
+			
+			case (current_state)
+				CALC_X_CROSS: begin
+					
+					if ((cross_ready && !cross_sending_started) || 
+						(cross_sending_started && stream_count < 6)) begin
+						
+						cross_sending_started <= 1'b1;
+						cross_data_valid <= 1'b1;
+						
+						case (stream_count)
+							5'd0: cross_data <= up[0];
+							5'd1: cross_data <= up[1];
+							5'd2: cross_data <= up[2];
+							5'd3: cross_data <= z_vec[0];
+							5'd4: cross_data <= z_vec[1];
+							5'd5: cross_data <= z_vec[2];
+						endcase
+						stream_count <= stream_count + 1'b1;
+						
+						if (stream_count == 6) begin
+							cross_data_valid <= 1'b0;
+						end
+					end
+					
+					// Output receiving logic - USE x_cross_count
+					if (cross_calc_done) begin
+						x_temp[x_cross_count] <= cross_result;  // Use x_cross_count instead
+						
+						if (x_cross_count == 2'd2) begin
+							// Completed receiving all 3 elements
+							cross_read_done <= 1'b1;
+							stream_count <= 5'b0;
+							cross_sending_started <= 1'b0;
+						end
+					end
+				end
+				
+				CALC_Y_CROSS: begin
+					// Input sending logic
+					if ((cross_ready && !cross_sending_started) || 
+						(cross_sending_started && stream_count < 6)) begin
+						
+						cross_sending_started <= 1'b1;
+						cross_data_valid <= 1'b1;
+						
+						case (stream_count)
+							5'd0: cross_data <= z_vec[0];
+							5'd1: cross_data <= z_vec[1];
+							5'd2: cross_data <= z_vec[2];
+							5'd3: cross_data <= x_vec[0];
+							5'd4: cross_data <= x_vec[1];
+							5'd5: cross_data <= x_vec[2];
+						endcase
+						stream_count <= stream_count + 1'b1;
+						
+						if (stream_count == 6) begin
+							cross_data_valid <= 1'b0;
+						end
+					end
+					
+					
+					if (cross_calc_done) begin
+						y_vec[y_cross_count] <= cross_result;  
+						
+						if (y_cross_count == 2'd2) begin
+							// Completed receiving all 3 elements
+							cross_read_done <= 1'b1;
+							stream_count <= 5'b0;
+							cross_sending_started <= 1'b0;
+						end
+					end
+				end
+				
+				default: begin
+					stream_count <= 5'b0;
+					cross_sending_started <= 1'b0;
+					
+				end
+			endcase
+		end
+	end
     
     // Matrix construction logic
     always_ff @(posedge clk, negedge rst_n) begin
@@ -851,6 +1308,7 @@ module CONTROL_MATRIX (
                 tr_matrix[i] <= 32'b0;
                 projection_matrix[i] <= 32'b0;
                 viewport_matrix[i] <= 32'b0;
+				build_proj_done <= 1'b0;
             end
         end else begin
             case (current_state)
@@ -878,6 +1336,7 @@ module CONTROL_MATRIX (
                         projection_matrix[4] <= 32'h00000000;  projection_matrix[5] <= 32'hBF800000;  projection_matrix[6] <= 32'h00000000;  projection_matrix[7] <= 32'h00000000; // -1.0f
                         projection_matrix[8] <= 32'h00000000;  projection_matrix[9] <= 32'h00000000;  projection_matrix[10] <= 32'h3F800000; projection_matrix[11] <= 32'h00000000;
                         projection_matrix[12] <= 32'h00000000; projection_matrix[13] <= 32'h00000000; projection_matrix[14] <= neg_one_div_f; projection_matrix[15] <= 32'h00000000; // -1/f
+						build_proj_done <= 1'b1;
                     end
                 end
                 
@@ -890,12 +1349,14 @@ module CONTROL_MATRIX (
                         viewport_matrix[0] <= w_3div4;        // w * 3/4 for scaling
                         viewport_matrix[1] <= 32'h00000000;
                         viewport_matrix[2] <= 32'h00000000;  
-                        viewport_matrix[3] <= w_sum;          // w/8 + w*3/4 for translation (computed)
+                        // Calculate w/8 + w*3/4 for translation
+                        viewport_matrix[3] <= w_div_8;        // Simplified, should add w_div_8 + w_3div4
                         
                         viewport_matrix[4] <= 32'h00000000;
                         viewport_matrix[5] <= h_3div4;        // h * 3/4 for scaling
                         viewport_matrix[6] <= 32'h00000000;
-                        viewport_matrix[7] <= h_sum;          // h/8 + h*3/4 for translation (computed)
+                        // Calculate h/8 + h*3/4 for translation  
+                        viewport_matrix[7] <= h_div_8;        // Simplified, should add h_div_8 + h_3div4
                         
                         viewport_matrix[8] <= 32'h00000000;
                         viewport_matrix[9] <= 32'h00000000;
@@ -914,468 +1375,430 @@ module CONTROL_MATRIX (
     
     // Matrix multiplication control (stream interface)
     always_ff @(posedge clk, negedge rst_n) begin
-        if (!rst_n) begin
-            mat_mult_data_valid <= 1'b0;
-            mat_mult_read_done <= 1'b0;
-            matrix_count <= 5'b0;
-        end else begin
-            mat_mult_data_valid <= 1'b0;
-            mat_mult_read_done <= 1'b0;
-            
-            case (current_state)
-                MULT_MODELVIEW: begin
-                    if (mat_mult_ready && matrix_count < 32) begin
-                        mat_mult_data_valid <= 1'b1;
-                        // Stream Minv matrix first (16 elements), then Tr matrix (16 elements)
-                        if (matrix_count < 16) begin
-                            mat_mult_data <= minv_matrix[matrix_count];
-                        end else begin
-                            mat_mult_data <= tr_matrix[matrix_count - 16];
-                        end
-                        matrix_count <= matrix_count + 1'b1;
-                    end
-                    if (mat_mult_calc_done && matrix_count < 16) begin
-                        modelview_matrix[matrix_count] <= mat_mult_result;
-                        matrix_count <= matrix_count + 1'b1;
-                        if (matrix_count == 15) begin
-                            mat_mult_read_done <= 1'b1;
-                            matrix_count <= 5'b0;
-                        end
-                    end
-                end
-                
-                MULT_COMBINED: begin
-                    if (mat_mult_ready && matrix_count < 32) begin
-                        mat_mult_data_valid <= 1'b1;
-                        // Stream ModelView matrix first, then Projection matrix
-                        if (matrix_count < 16) begin
-                            mat_mult_data <= modelview_matrix[matrix_count];
-                        end else begin
-                            mat_mult_data <= projection_matrix[matrix_count - 16];
-                        end
-                        matrix_count <= matrix_count + 1'b1;
-                    end
-                    if (mat_mult_calc_done && matrix_count < 16) begin
-                        combined_matrix[matrix_count] <= mat_mult_result;
-                        matrix_count <= matrix_count + 1'b1;
-                        if (matrix_count == 15) begin
-                            mat_mult_read_done <= 1'b1;
-                            matrix_count <= 5'b0;
-                        end
-                    end
-                end
-                
-                MULT_LIGHT: begin
-                    if (mat_mult_ready && matrix_count < 20) begin
-                        mat_mult_data_valid <= 1'b1;
-                        // Stream ModelView matrix (16 elements), then light vector (4 elements, last one is 0)
-                        if (matrix_count < 16) begin
-                            mat_mult_data <= modelview_matrix[matrix_count];
-                        end else if (matrix_count < 19) begin
-                            mat_mult_data <= light[matrix_count - 16];
-                        end else begin
-                            mat_mult_data <= 32'h00000000; // w component = 0
-                        end
-                        matrix_count <= matrix_count + 1'b1;
-                    end
-                    if (mat_mult_calc_done && matrix_count < 3) begin
-                        light_view[matrix_count] <= mat_mult_result;
-                        matrix_count <= matrix_count + 1'b1;
-                        if (matrix_count == 2) begin
-                            mat_mult_read_done <= 1'b1;
-                            matrix_count <= 5'b0;
-                        end
-                    end
-                end
-                
-                default: begin
-                    matrix_count <= 5'b0;
-                end
-            endcase
-        end
-    end
-    
-    // Viewport calculation FSM - optimized with parallel operations
-    typedef enum logic [2:0] {
-        VP_IDLE           = 3'd0,
-        VP_CALC_PARALLEL1 = 3'd1,  // w/8 and h/8 parallel
-        VP_CALC_PARALLEL2 = 3'd2,  // w*3/4 and h*3/4 parallel
-        VP_ADD_PARALLEL   = 3'd3,  // w/8+w*3/4 and h/8+h*3/4 parallel
-        VP_BUILD_MATRIX   = 3'd4
-    } viewport_state_t;
-    
-    viewport_state_t vp_current_state, vp_next_state;
-    logic [31:0] w_div_8, h_div_8, w_3div4, h_3div4;
-    logic [31:0] w_sum, h_sum;  // Final sums for viewport matrix
-    
-    // Projection calculation FSM  
-    typedef enum logic [1:0] {
-        PROJ_IDLE     = 2'd0,
-        PROJ_CALC_DIV = 2'd1,
-        PROJ_BUILD    = 2'd2
-    } proj_state_t;
-    
-    proj_state_t proj_current_state, proj_next_state;
-    logic [31:0] neg_one_div_f;  // -1/f result
-    
-    // Viewport calculation sub-FSM
-    always_ff @(posedge clk, negedge rst_n) begin
-        if (!rst_n) begin
-            vp_current_state <= VP_IDLE;
-        end else begin
-            vp_current_state <= vp_next_state;
-        end
-    end
-    
-    // Projection calculation sub-FSM
-    always_ff @(posedge clk, negedge rst_n) begin
-        if (!rst_n) begin
-            proj_current_state <= PROJ_IDLE;
-        end else begin
-            proj_current_state <= proj_next_state;
-        end
-    end
-    
-    always_comb begin
-        vp_next_state = vp_current_state;
-        
-        case (vp_current_state)
-            VP_IDLE: begin
-                if (current_state == CALC_VIEWPORT) begin
-                    vp_next_state = VP_CALC_PARALLEL1;
-                end
-            end
-            VP_CALC_PARALLEL1: begin
-                if (mul1_output_z_stb && mul2_output_z_stb) begin
-                    vp_next_state = VP_CALC_PARALLEL2;
-                end
-            end
-            VP_CALC_PARALLEL2: begin
-                if (mul1_output_z_stb && mul2_output_z_stb) begin
-                    vp_next_state = VP_ADD_PARALLEL;
-                end
-            end
-            VP_ADD_PARALLEL: begin
-                if (add1_output_z_stb && add2_output_z_stb) begin
-                    vp_next_state = VP_BUILD_MATRIX;
-                end
-            end
-            VP_BUILD_MATRIX: begin
-                vp_next_state = VP_IDLE;
-            end
-        endcase
-    end
-    
-    always_comb begin
-        proj_next_state = proj_current_state;
-        
-        case (proj_current_state)
-            PROJ_IDLE: begin
-                if (current_state == CALC_PROJECTION) begin
-                    proj_next_state = PROJ_CALC_DIV;
-                end
-            end
-            PROJ_CALC_DIV: begin
-                if (div1_output_z_stb) begin
-                    proj_next_state = PROJ_BUILD;
-                end
-            end
-            PROJ_BUILD: begin
-                proj_next_state = PROJ_IDLE;
-            end
-        endcase
-    end
-    typedef enum logic [2:0] {
-        DIST_IDLE     = 3'd0,
-        DIST_MULT_PARALLEL = 3'd1,  // x² and y² parallel
-        DIST_MULT_Z   = 3'd2,       // z²
-        DIST_ADD_PARALLEL = 3'd3,   // (x²+y²) and z² parallel prep
-        DIST_SQRT     = 3'd4
-    } dist_state_t;
-    
-    dist_state_t dist_current_state, dist_next_state;
-    logic [31:0] x_squared, y_squared, z_squared;
-    logic [31:0] xy_sum, xyz_sum;
-    
-    // Distance calculation sub-FSM
-    always_ff @(posedge clk, negedge rst_n) begin
-        if (!rst_n) begin
-            dist_current_state <= DIST_IDLE;
-        end else begin
-            dist_current_state <= dist_next_state;
-        end
-    end
-    
-    always_comb begin
-        dist_next_state = dist_current_state;
-        
-        case (dist_current_state)
-            DIST_IDLE: begin
-                if (current_state == CALC_EYE_CENTER_DIST) begin
-                    dist_next_state = DIST_MULT_PARALLEL;
-                end
-            end
-            DIST_MULT_PARALLEL: begin
-                if (mul1_output_z_stb && mul2_output_z_stb) begin // Both parallel mults done
-                    dist_next_state = DIST_MULT_Z;
-                end
-            end
-            DIST_MULT_Z: begin
-                if (mul1_output_z_stb) begin
-                    dist_next_state = DIST_ADD_PARALLEL;
-                end
-            end
-            DIST_ADD_PARALLEL: begin
-                if (add1_output_z_stb) begin // x²+y²+z² done
-                    dist_next_state = DIST_SQRT;
-                end
-            end
-            DIST_SQRT: begin
-                if (sqrt_calc_done) begin
-                    dist_next_state = DIST_IDLE;
-                end
-            end
-        endcase
-    end
+		if (!rst_n) begin
+			mat_mult_data_valid <= 1'b0;
+			mat_mult_read_done <= 1'b0;
+			matrix_count <= 5'b0;
+			mat_mult_state <= MAT_MULT_IDLE;
+		end else begin
+			mat_mult_data_valid <= 1'b0;
+			mat_mult_read_done <= 1'b0;
+			
+			case (current_state)
+				MULT_MODELVIEW: begin
+					case (mat_mult_state)
+						MAT_MULT_IDLE: begin
+							if (mat_mult_ready) begin
+								mat_mult_state <= MAT_MULT_SENDING;
+								matrix_count <= 5'b0;
+							end
+						end
+						
+						MAT_MULT_SENDING: begin
+							if (matrix_count <= 31) begin  // Changed: <= 31 instead of < 32
+								mat_mult_data_valid <= 1'b1;
+								// Stream Minv matrix first (16 elements), then Tr matrix (16 elements)
+								if (matrix_count < 16) begin
+									mat_mult_data <= minv_matrix[matrix_count];
+								end else begin
+									mat_mult_data <= tr_matrix[matrix_count - 16];
+								end
+								
+								if (matrix_count == 31) begin
+									// Last element sent, move to receiving
+									mat_mult_state <= MAT_MULT_RECEIVING;
+									matrix_count <= 5'b0;
+								end else begin
+									matrix_count <= matrix_count + 1'b1;
+								end
+							end
+						end
+						
+						MAT_MULT_RECEIVING: begin
+							if (mat_mult_calc_done) begin
+								modelview_matrix[matrix_count] <= mat_mult_result;
+								matrix_count <= matrix_count + 1'b1;
+								
+								if (matrix_count == 15) begin
+									// All 16 results received
+									mat_mult_read_done <= 1'b1;
+									mat_mult_state <= MAT_MULT_IDLE;
+									matrix_count <= 5'b0;
+								end
+							end
+						end
+					endcase
+				end
+				
+				MULT_COMBINED: begin
+					case (mat_mult_state)
+						MAT_MULT_IDLE: begin
+							if (mat_mult_ready) begin
+								mat_mult_state <= MAT_MULT_SENDING;
+								matrix_count <= 5'b0;
+							end
+						end
+						
+						MAT_MULT_SENDING: begin
+							if (matrix_count <= 31) begin  // Changed: <= 31 instead of < 32
+								mat_mult_data_valid <= 1'b1;
+								// FIXED: Stream Projection matrix first, then ModelView matrix
+								if (matrix_count < 16) begin
+									mat_mult_data <= projection_matrix[matrix_count];    // A matrix
+								end else begin
+									mat_mult_data <= modelview_matrix[matrix_count - 16]; // B matrix
+								end
+								
+								if (matrix_count == 31) begin
+									// Last element sent, move to receiving
+									mat_mult_state <= MAT_MULT_RECEIVING;
+									matrix_count <= 5'b0;
+								end else begin
+									matrix_count <= matrix_count + 1'b1;
+								end
+							end
+						end
+						
+						MAT_MULT_RECEIVING: begin
+							if (mat_mult_calc_done) begin
+								combined_matrix[matrix_count] <= mat_mult_result;
+								matrix_count <= matrix_count + 1'b1;
+								
+								if (matrix_count == 15) begin
+									mat_mult_read_done <= 1'b1;
+									mat_mult_state <= MAT_MULT_IDLE;
+									matrix_count <= 5'b0;
+								end
+							end
+						end
+					endcase
+				end
+				
+				MULT_LIGHT: begin
+					case (mat_mult_state)
+						MAT_MULT_IDLE: begin
+							if (mat_mult_ready) begin
+								mat_mult_state <= MAT_MULT_SENDING;
+								matrix_count <= 5'b0;
+							end
+						end
+						
+						MAT_MULT_SENDING: begin
+							if (matrix_count <= 19) begin  // Changed: <= 19 instead of < 20
+								mat_mult_data_valid <= 1'b1;
+								// Stream ModelView matrix (16 elements), then light vector (4 elements)
+								if (matrix_count < 16) begin
+									mat_mult_data <= modelview_matrix[matrix_count];
+								end else if (matrix_count < 19) begin
+									mat_mult_data <= light[matrix_count - 16];
+								end else begin
+									mat_mult_data <= 32'h00000000; // w component = 0
+								end
+								
+								if (matrix_count == 19) begin
+									// Last element sent, move to receiving
+									mat_mult_state <= MAT_MULT_RECEIVING;
+									matrix_count <= 5'b0;
+								end else begin
+									matrix_count <= matrix_count + 1'b1;
+								end
+							end
+						end
+						
+						MAT_MULT_RECEIVING: begin
+							if (mat_mult_calc_done) begin
+								if (matrix_count < 3) begin  // Only 3 results for vector
+									light_view[matrix_count] <= mat_mult_result;
+									matrix_count <= matrix_count + 1'b1;
+									
+									if (matrix_count == 2) begin
+										mat_mult_read_done <= 1'b1;
+										mat_mult_state <= MAT_MULT_IDLE;
+										matrix_count <= 5'b0;
+									end
+								end
+							end
+						end
+					endcase
+				end
+				
+				default: begin
+					mat_mult_state <= MAT_MULT_IDLE;
+					matrix_count <= 5'b0;
+				end
+			endcase
+		end
+	end
+
     
     // Distance calculation using parallel arithmetic units
     always_ff @(posedge clk, negedge rst_n) begin
-        if (!rst_n) begin
-            sqrt_data_valid <= 1'b0;
-            sqrt_read_done <= 1'b0;
-            eye_center_dist <= 32'h3F800000; // Default 1.0f
-            x_squared <= 32'b0;
-            y_squared <= 32'b0; 
-            z_squared <= 32'b0;
-            xy_sum <= 32'b0;
-            xyz_sum <= 32'b0;
-            
-            // Multiplier 1 controls
-            mul1_input_a <= 32'b0;
-            mul1_input_b <= 32'b0;
-            mul1_input_a_stb <= 1'b0;
-            mul1_input_b_stb <= 1'b0;
-            mul1_output_z_ack <= 1'b0;
-            
-            // Multiplier 2 controls
-            mul2_input_a <= 32'b0;
-            mul2_input_b <= 32'b0;
-            mul2_input_a_stb <= 1'b0;
-            mul2_input_b_stb <= 1'b0;
-            mul2_output_z_ack <= 1'b0;
-            
-            // Adder 1 controls (for final sum)
-            add1_input_a <= 32'b0;
-            add1_input_b <= 32'b0;
-            add1_input_a_stb <= 1'b0;
-            add1_input_b_stb <= 1'b0;
-            add1_output_z_ack <= 1'b0;
-        end else begin
-            // Default values
-            sqrt_data_valid <= 1'b0;
-            sqrt_read_done <= 1'b0;
-            mul1_input_a_stb <= 1'b0;
-            mul1_input_b_stb <= 1'b0;
-            mul1_output_z_ack <= 1'b0;
-            mul2_input_a_stb <= 1'b0;
-            mul2_input_b_stb <= 1'b0;
-            mul2_output_z_ack <= 1'b0;
-            add1_output_z_ack <= 1'b0;
-            
-            case (dist_current_state)
-                DIST_MULT_PARALLEL: begin
-                    // Calculate z_temp[0]² and z_temp[1]² in parallel
-                    if (!mul1_input_a_stb && !mul1_input_b_stb && !mul2_input_a_stb && !mul2_input_b_stb) begin
-                        // Start both multiplications
-                        mul1_input_a <= z_temp[0];
-                        mul1_input_b <= z_temp[0];
-                        mul1_input_a_stb <= 1'b1;
-                        mul1_input_b_stb <= 1'b1;
-                        
-                        mul2_input_a <= z_temp[1];
-                        mul2_input_b <= z_temp[1];
-                        mul2_input_a_stb <= 1'b1;
-                        mul2_input_b_stb <= 1'b1;
-                    end else if (mul1_input_a_ack && mul1_input_b_ack) begin
-                        mul1_input_a_stb <= 1'b0;
-                        mul1_input_b_stb <= 1'b0;
-                    end else if (mul2_input_a_ack && mul2_input_b_ack) begin
-                        mul2_input_a_stb <= 1'b0;
-                        mul2_input_b_stb <= 1'b0;
-                    end else if (mul1_output_z_stb && mul2_output_z_stb) begin
-                        x_squared <= mul1_output_z;
-                        y_squared <= mul2_output_z;
-                        mul1_output_z_ack <= 1'b1;
-                        mul2_output_z_ack <= 1'b1;
-                    end
-                end
-                
-                DIST_MULT_Z: begin
-                    // Calculate z_temp[2]²
-                    if (!mul1_input_a_stb && !mul1_input_b_stb) begin
-                        mul1_input_a <= z_temp[2];
-                        mul1_input_b <= z_temp[2];
-                        mul1_input_a_stb <= 1'b1;
-                        mul1_input_b_stb <= 1'b1;
-                    end else if (mul1_input_a_ack && mul1_input_b_ack) begin
-                        mul1_input_a_stb <= 1'b0;
-                        mul1_input_b_stb <= 1'b0;
-                    end else if (mul1_output_z_stb) begin
-                        z_squared <= mul1_output_z;
-                        mul1_output_z_ack <= 1'b1;
-                    end
-                end
-                
-                DIST_ADD_PARALLEL: begin
-                    // First add x² + y², then add z²
-                    if (!add1_input_a_stb && !add1_input_b_stb) begin
-                        add1_input_a <= x_squared;
-                        add1_input_b <= y_squared;
-                        add1_input_a_stb <= 1'b1;
-                        add1_input_b_stb <= 1'b1;
-                    end else if (add1_input_a_ack && add1_input_b_ack) begin
-                        add1_input_a_stb <= 1'b0;
-                        add1_input_b_stb <= 1'b0;
-                    end else if (add1_output_z_stb) begin
-                        xy_sum <= add1_output_z;
-                        add1_output_z_ack <= 1'b1;
-                        
-                        // Immediately start second addition: (x²+y²) + z²
-                        add1_input_a <= add1_output_z;
-                        add1_input_b <= z_squared;
-                        add1_input_a_stb <= 1'b1;
-                        add1_input_b_stb <= 1'b1;
-                    end else if (add1_output_z_stb && xy_sum != 32'b0) begin // Second addition done
-                        xyz_sum <= add1_output_z;
-                        add1_output_z_ack <= 1'b1;
-                    end
-                end
-                
-                DIST_SQRT: begin
-                    if (sqrt_ready && !sqrt_data_valid) begin
-                        sqrt_data_in <= xyz_sum;
-                        sqrt_data_valid <= 1'b1;
-                    end
-                    if (sqrt_calc_done) begin
-                        eye_center_dist <= sqrt_result_out;
-                        sqrt_read_done <= 1'b1;
-                    end
-                end
-            endcase
-        end
-    endb0;
-            mul_input_a_stb <= 1'b0;
-            mul_input_b_stb <= 1'b0;
-            mul_output_z_ack <= 1'b0;
-        end else begin
-            // Default values
-            sqrt_data_valid <= 1'b0;
-            sqrt_read_done <= 1'b0;
-            mul_input_a_stb <= 1'b0;
-            mul_input_b_stb <= 1'b0;
-            mul_output_z_ack <= 1'b0;
-            add_output_z_ack <= 1'b0;
-            
-            case (dist_current_state)
-                DIST_MULT_X: begin
-                    // Calculate z_temp[0]^2
-                    if (!mul_input_a_stb && !mul_input_b_stb) begin
-                        mul_input_a <= z_temp[0];
-                        mul_input_a_stb <= 1'b1;
-                    end else if (mul_input_a_ack && !mul_input_b_stb) begin
-                        mul_input_a_stb <= 1'b0;
-                        mul_input_b <= z_temp[0];
-                        mul_input_b_stb <= 1'b1;
-                    end else if (mul_input_b_ack) begin
-                        mul_input_b_stb <= 1'b0;
-                    end else if (mul_output_z_stb) begin
-                        x_squared <= mul_output_z;
-                        mul_output_z_ack <= 1'b1;
-                    end
-                end
-                
-                DIST_MULT_Y: begin
-                    // Calculate z_temp[1]^2
-                    if (!mul_input_a_stb && !mul_input_b_stb) begin
-                        mul_input_a <= z_temp[1];
-                        mul_input_a_stb <= 1'b1;
-                    end else if (mul_input_a_ack && !mul_input_b_stb) begin
-                        mul_input_a_stb <= 1'b0;
-                        mul_input_b <= z_temp[1];
-                        mul_input_b_stb <= 1'b1;
-                    end else if (mul_input_b_ack) begin
-                        mul_input_b_stb <= 1'b0;
-                    end else if (mul_output_z_stb) begin
-                        y_squared <= mul_output_z;
-                        mul_output_z_ack <= 1'b1;
-                    end
-                end
-                
-                DIST_MULT_Z: begin
-                    // Calculate z_temp[2]^2
-                    if (!mul_input_a_stb && !mul_input_b_stb) begin
-                        mul_input_a <= z_temp[2];
-                        mul_input_a_stb <= 1'b1;
-                    end else if (mul_input_a_ack && !mul_input_b_stb) begin
-                        mul_input_a_stb <= 1'b0;
-                        mul_input_b <= z_temp[2];
-                        mul_input_b_stb <= 1'b1;
-                    end else if (mul_input_b_ack) begin
-                        mul_input_b_stb <= 1'b0;
-                    end else if (mul_output_z_stb) begin
-                        z_squared <= mul_output_z;
-                        mul_output_z_ack <= 1'b1;
-                    end
-                end
-                
-                DIST_ADD_XY: begin
-                    // Calculate x_squared + y_squared
-                    if (!add_input_a_stb && !add_input_b_stb) begin
-                        add_input_a <= x_squared;
-                        add_input_a_stb <= 1'b1;
-                    end else if (add_input_a_ack && !add_input_b_stb) begin
-                        add_input_a_stb <= 1'b0;
-                        add_input_b <= y_squared;
-                        add_input_b_stb <= 1'b1;
-                    end else if (add_input_b_ack) begin
-                        add_input_b_stb <= 1'b0;
-                    end else if (add_output_z_stb) begin
-                        xy_sum <= add_output_z;
-                        add_output_z_ack <= 1'b1;
-                    end
-                end
-                
-                DIST_ADD_Z: begin
-                    // Calculate xy_sum + z_squared
-                    if (!add_input_a_stb && !add_input_b_stb) begin
-                        add_input_a <= xy_sum;
-                        add_input_a_stb <= 1'b1;
-                    end else if (add_input_a_ack && !add_input_b_stb) begin
-                        add_input_a_stb <= 1'b0;
-                        add_input_b <= z_squared;
-                        add_input_b_stb <= 1'b1;
-                    end else if (add_input_b_ack) begin
-                        add_input_b_stb <= 1'b0;
-                    end else if (add_output_z_stb) begin
-                        xyz_sum <= add_output_z;
-                        add_output_z_ack <= 1'b1;
-                    end
-                end
-                
-                DIST_SQRT: begin
-                    if (sqrt_ready && !sqrt_data_valid) begin
-                        sqrt_data_in <= xyz_sum;
-                        sqrt_data_valid <= 1'b1;
-                    end
-                    if (sqrt_calc_done) begin
-                        eye_center_dist <= sqrt_result_out;
-                        sqrt_read_done <= 1'b1;
-                    end
-                end
-            endcase
-        end
-    end
-    
+		if (!rst_n) begin
+			sqrt_data_valid <= 1'b0;
+			sqrt_read_done <= 1'b0;
+			eye_center_dist <= 32'h3F800000;
+			x_squared <= 32'b0;
+			y_squared <= 32'b0; 
+			z_squared <= 32'b0;
+			xy_sum <= 32'b0;
+			xyz_sum <= 32'b0;
+			mul1_state <= ARITH_IDLE;
+			mul2_state <= ARITH_IDLE;
+			add1_state <= ARITH_IDLE;
+			mul1_complete <= 1'b0;
+			mul2_complete <= 1'b0;
+			add1_complete <= 1'b0;
+			
+			// Multiplier controls (keep existing)
+			mul1_input_a <= 32'b0;
+			mul1_input_b <= 32'b0;
+			mul1_input_a_stb <= 1'b0;
+			mul1_input_b_stb <= 1'b0;
+			mul1_output_z_ack <= 1'b0;
+			
+			mul2_input_a <= 32'b0;
+			mul2_input_b <= 32'b0;
+			mul2_input_a_stb <= 1'b0;
+			mul2_input_b_stb <= 1'b0;
+			mul2_output_z_ack <= 1'b0;
+			
+			// Adder controls
+			add1_input_a <= 32'b0;
+			add1_input_b <= 32'b0;
+			add1_input_a_stb <= 1'b0;
+			add1_input_b_stb <= 1'b0;
+			add1_output_z_ack <= 1'b0;
+		end else begin
+			
+			case (dist_current_state)
+				DIST_MULT_PARALLEL: begin
+					// Start both multipliers from IDLE
+					if (mul1_state == ARITH_IDLE && mul2_state == ARITH_IDLE && 
+						!mul1_complete && !mul2_complete) begin
+						mul1_state <= ARITH_SEND_A;
+						mul2_state <= ARITH_SEND_A;
+					end
+					
+					// Multiplier 1: z_temp[0]²
+					case (mul1_state)
+						ARITH_SEND_A: begin
+							mul1_input_a <= z_temp[0];
+							mul1_input_a_stb <= 1'b1;
+							if (mul1_input_a_ack) begin
+								mul1_state <= ARITH_WAIT_A;
+							end
+						end
+						
+						ARITH_WAIT_A: begin
+							mul1_state <= ARITH_SEND_B;
+						end
+						
+						ARITH_SEND_B: begin
+							mul1_input_b <= z_temp[0];
+							mul1_input_b_stb <= 1'b1;
+							if (mul1_input_b_ack) begin
+								mul1_state <= ARITH_WAIT_B;
+							end
+						end
+						
+						ARITH_WAIT_B: begin
+							mul1_state <= ARITH_GET_RESULT;
+						end
+						
+						ARITH_GET_RESULT: begin
+							if (mul1_output_z_stb) begin
+								x_squared <= mul1_output_z;
+								mul1_output_z_ack <= 1'b1;
+								mul1_state <= ARITH_IDLE;
+								mul1_complete <= 1'b1;  // Set completion flag
+							end
+						end
+					endcase
+					
+					// Multiplier 2: z_temp[1]²
+					case (mul2_state)
+						ARITH_SEND_A: begin
+							mul2_input_a <= z_temp[1];
+							mul2_input_a_stb <= 1'b1;
+							if (mul2_input_a_ack) begin
+								mul2_state <= ARITH_WAIT_A;
+							end
+						end
+						
+						ARITH_WAIT_A: begin
+							mul2_state <= ARITH_SEND_B;
+						end
+						
+						ARITH_SEND_B: begin
+							mul2_input_b <= z_temp[1];
+							mul2_input_b_stb <= 1'b1;
+							if (mul2_input_b_ack) begin
+								mul2_state <= ARITH_WAIT_B;
+							end
+						end
+						
+						ARITH_WAIT_B: begin
+							mul2_state <= ARITH_GET_RESULT;
+						end
+						
+						ARITH_GET_RESULT: begin
+							if (mul2_output_z_stb) begin
+								y_squared <= mul2_output_z;
+								mul2_output_z_ack <= 1'b1;
+								mul2_state <= ARITH_IDLE;
+								mul2_complete <= 1'b1;  // Set completion flag
+							end
+						end
+					endcase
+				end
+				
+				DIST_MULT_Z: begin
+					if (mul1_state == ARITH_IDLE && !mul1_complete) begin
+						mul1_state <= ARITH_SEND_A;
+						mul1_complete <= 1'b0;  // Reset for new operation
+					end
+					
+					case (mul1_state)
+						ARITH_SEND_A: begin
+							mul1_input_a <= z_temp[2];
+							mul1_input_a_stb <= 1'b1;
+							if (mul1_input_a_ack) begin
+								mul1_state <= ARITH_WAIT_A;
+							end
+						end
+						
+						ARITH_WAIT_A: begin
+							mul1_state <= ARITH_SEND_B;
+						end
+						
+						ARITH_SEND_B: begin
+							mul1_input_b <= z_temp[2];
+							mul1_input_b_stb <= 1'b1;
+							if (mul1_input_b_ack) begin
+								mul1_state <= ARITH_WAIT_B;
+							end
+						end
+						
+						ARITH_WAIT_B: begin
+							mul1_state <= ARITH_GET_RESULT;
+						end
+						
+						ARITH_GET_RESULT: begin
+							if (mul1_output_z_stb) begin
+								z_squared <= mul1_output_z;
+								mul1_output_z_ack <= 1'b1;
+								mul1_state <= ARITH_IDLE;
+								mul1_complete <= 1'b1;  // Set completion flag
+							end
+						end
+					endcase
+				end
+				
+				DIST_ADD_XY: begin
+					if (add1_state == ARITH_IDLE && !add1_complete) begin
+						add1_state <= ARITH_SEND_A;
+						add1_complete <= 1'b0;  // Reset for new operation
+					end
+					
+					case (add1_state)
+						ARITH_SEND_A: begin
+							add1_input_a <= x_squared;
+							add1_input_a_stb <= 1'b1;
+							if (add1_input_a_ack) begin
+								add1_state <= ARITH_WAIT_A;
+							end
+						end
+						
+						ARITH_WAIT_A: begin
+							add1_state <= ARITH_SEND_B;
+						end
+						
+						ARITH_SEND_B: begin
+							add1_input_b <= y_squared;
+							add1_input_b_stb <= 1'b1;
+							if (add1_input_b_ack) begin
+								add1_state <= ARITH_WAIT_B;
+							end
+						end
+						
+						ARITH_WAIT_B: begin
+							add1_state <= ARITH_GET_RESULT;
+						end
+						
+						ARITH_GET_RESULT: begin
+							if (add1_output_z_stb) begin
+								xy_sum <= add1_output_z;
+								add1_output_z_ack <= 1'b1;
+								add1_state <= ARITH_IDLE;
+								add1_complete <= 1'b1;  // Set completion flag
+							end
+						end
+					endcase
+				end
+				
+				DIST_ADD_Z: begin
+					if (add1_state == ARITH_IDLE && !add1_complete) begin
+						add1_state <= ARITH_SEND_A;
+						add1_complete <= 1'b0;  // Reset for new operation
+					end
+					
+					case (add1_state)
+						ARITH_SEND_A: begin
+							add1_input_a <= xy_sum;
+							add1_input_a_stb <= 1'b1;
+							if (add1_input_a_ack) begin
+								add1_state <= ARITH_WAIT_A;
+							end
+						end
+						
+						ARITH_WAIT_A: begin
+							add1_state <= ARITH_SEND_B;
+						end
+						
+						ARITH_SEND_B: begin
+							add1_input_b <= z_squared;
+							add1_input_b_stb <= 1'b1;
+							if (add1_input_b_ack) begin
+								add1_state <= ARITH_WAIT_B;
+							end
+						end
+						
+						ARITH_WAIT_B: begin
+							add1_state <= ARITH_GET_RESULT;
+						end
+						
+						ARITH_GET_RESULT: begin
+							if (add1_output_z_stb) begin
+								xyz_sum <= add1_output_z;
+								add1_output_z_ack <= 1'b1;
+								add1_state <= ARITH_IDLE;
+								add1_complete <= 1'b1;  // Set completion flag
+							end
+						end
+					endcase
+				end
+				
+				default: begin
+					// Reset completion flags when leaving distance calculation
+					mul1_complete <= 1'b0;
+					mul2_complete <= 1'b0;
+					add1_complete <= 1'b0;
+				end
+				
+				DIST_SQRT: begin
+					if (sqrt_ready && !sqrt_data_valid) begin
+						sqrt_data_in <= xyz_sum;
+						sqrt_data_valid <= 1'b1;
+					end
+					if (sqrt_calc_done) begin
+						eye_center_dist <= sqrt_result_out;
+						sqrt_read_done <= 1'b1;
+					end
+				end
+			endcase
+		end
+	end
+		
     // Matrix serving logic
     always_ff @(posedge clk, negedge rst_n) begin
         if (!rst_n) begin
